@@ -10,16 +10,14 @@ def readtext(fname):
 
 def create_dictionary_from_txt_dir(txt_dir):
     utt_text = {}
-    textfiles = glob.glob(txt_dir + '/*.txt')
+    fname = os.listdir(txt_dir)
+    fileids = [fi for fi in fname if not fi.startswith(".")]
+    fnum = len(fileids)
+    for i in range(fnum):
+        textfile = fileids[i]
+        filename = textfile.split('.')[0]
 
-    num_of_files = len(textfiles)
-
-    for i in range(num_of_files):
-        textfile = textfiles[i]
-        junk,filename = os.path.split(textfile)
-        filename = filename.split('.')[0]
-
-        text = readtext(textfile)
+        text = readtext(textfile, txt_dir)
         utt_text[filename] = text
 
     return utt_text
