@@ -48,6 +48,8 @@ import sys, os, subprocess, glob, subprocess
 
 from io_funcs.binary_io import  BinaryIOCollection
 import numpy as np
+import scipy
+from scipy.io import wavfile
 
 import logging
 
@@ -315,6 +317,155 @@ def wavgen_magphase(gen_dir, file_id_list, cfg, logger):
 
     return
 
+from label_normalisation import HTSLabelNormalisation
+
+def get_label_type(n_frames_total, label_feature_matrix, discrete_dict, continuous_dict):
+    
+    lab_idx_rowwise = []
+
+    for row in range(n_frames_total):
+        curr_row_bin = label_feature_matrix[row,0:len(discrete_dict)]
+        curr_row_cont = label_feature_matrix[0,len(discrete_dict):(len(discrete_dict) + len(continuous_dict))]
+        count_bin = 0
+        count_cont = 0
+        row_idx = {}
+        
+        for binlab in curr_row_bin:
+            if binlab > 0.01:
+                row_idx['bin %d' %count_bin] = count_bin
+            count_bin += 1
+
+        for contlab in curr_row_cont:
+            if contlab > 0.01:
+                row_idx['cont %d' %count_cont] = count_cont
+            count_cont += 1
+
+        lab_idx_rowwise.append(row_idx)
+
+    return lab_idx_rowwise
+
+def label_lookup_all(lab_idx, discrete_dict, continuous_dict, ph_sel_dict):
+
+    label_type_file = []
+    phoneme_superset = [0, 4, 5, 46, 51, 56, 47, 52, 58]
+    label_string = ph_sel_dict
+    for label_row in lab_idx:
+        for k, v in label_row.items():
+            if k.startswith('bin') and v in phoneme_superset:
+                label_type_file.append(ph_sel_dict[str(v)])
+    return(label_type_file)
+
+def wavwrite(filename, wav, fs, enc=None, norm_max_ifneeded=False, norm_max=False, verbose=0):
+
+    if norm_max:
+        wav_max = np.max(np.abs(wav))
+        wav /= 1.05*wav_max
+
+    elif norm_max_ifneeded:
+        wav_max = np.max(np.abs(wav))
+        if wav_max>=1.0:
+            print('    WARNING: sigproc.wavwrite: waveform in file {} is clipping. Rescaling between [-1,1]'.format(filename))
+            wav /= 1.05*wav_max
+
+    if np.max(np.abs(wav))>=1.0:
+        print('    WARNING: sigproc.wavwrite: waveform in file {} is clipping.'.format(filename))
+
+    if enc==None:        enc = np.int16
+    elif enc=='pcm16':   enc = np.int16
+    elif enc=='float32': raise ValueError('float not supported by scipy.io.wavfile')
+    wav = wav.copy()
+    wav = enc(np.iinfo(enc).max*wav)
+    scipy.io.wavfile.write(filename, fs, wav)
+    if verbose>0:
+        print('    Output: '+filename)
+
+
+
+
+def wavgen_pulsemodel(gen_dir, file_id_list, nm_type, fs, dftlen, shift, path_to_sptk = 0, path_to_hed = 0, path_to_lab = 0):
+
+    import pml_synthesis_class as pml
+    from itertools import groupby
+    import scipy
+    from scipy.io import wavfile   
+    
+    syn_func = pml.MerlinPmlSyn()
+
+    gen_dir = gen_dir 
+    sptk = path_to_sptk
+    path_to_hed = path_to_hed
+    lab_dir = path_to_lab
+    op_path = lab_dir
+    #normlab_dir = os.path.join(path_to_lab, 'nn_no_silence_lab_norm_426')
+    
+    pml_wav_dir  = os.path.join(gen_dir, 'wav' )
+
+    if not os.path.exists(pml_wav_dir):
+        os.mkdir(pml_wav_dir)
+
+    ph_sel_test = {'0': 'Vowel', '4': 'Liquid', '5':'Nasal', '46': 'Voiced_Stop', '51': 'Voiced_Fricative', 
+                '56': 'Affricate_Consonant', '47': 'Unvoiced_Stop', '52': 'Unvoiced_Fricative', '58': 'Silence'}
+
+    label_normaliser = HTSLabelNormalisation(question_file_name = path_to_hed)
+    discrete_dict, continuous_dict = label_normaliser.load_question_set_continous(path_to_hed)
+
+    nfiles = len(file_id_list)
+
+    fs = fs 
+    op_format = 2
+    mcsize = 59
+    shift = shift
+    dftlen = dftlen
+
+    for file in file_id_list:
+
+        path_to_lf0s = os.path.join(gen_dir, file + '.lf0')
+        path_to_mgc = os.path.join(gen_dir, file + '.mgc')
+        path_to_pddm = os.path.join(gen_dir, file + '.pddm')        
+
+        f0 = np.fromfile(path_to_lf0s, dtype=np.float32)
+        f0[f0>0] = np.exp(f0[f0>0])
+        ts = (shift)*np.arange(len(f0))
+        f0s = np.vstack((ts, f0)).T
+
+        pdd_thresh = 0.75 
+        MPDD = np.fromfile(path_to_pddm, dtype=np.float32)
+        MPDD = MPDD.reshape((len(f0s), -1))
+        PDD = syn_func.mcep2spec(MPDD, syn_func.bark_alpha(fs), dftlen, gen_dir, sptk)
+        
+        MCEP = np.fromfile(path_to_mgc, dtype=np.float32)
+        MCEP = MCEP.reshape((len(f0s), -1))
+        SPEC = syn_func.mcep2spec(MCEP, syn_func.bark_alpha(fs), dftlen, gen_dir, sptk)
+
+        curr_file = os.path.join(lab_dir, file + '.lab')
+        curr_lfm = syn_func.read_binfile(curr_file, dim=426, dtype=np.float32)
+        n_frames = len(curr_lfm)
+        curr_lab_idx = get_label_type(n_frames_total = n_frames, label_feature_matrix = curr_lfm, discrete_dict = discrete_dict, continuous_dict = continuous_dict)
+        label_strings = label_lookup_all(curr_lab_idx, discrete_dict, continuous_dict, ph_sel_test) 
+        HARM = PDD.copy()
+        HARM_LAB = list(zip(label_strings, HARM))
+
+        #maybe necessary to clip to 70Hz to avoid warning message 
+        f0s = syn_func.analysis_f0postproc(wav=None, fs = 16000, f0s = f0s, f0_min=70, f0_max=600, shift = 0.005)
+
+        if nm_type == 'binary':
+            NM = syn_func.analysis_nm_bin(fs = fs, f0s = f0s, PDD= PDD, nm_clean = True, verbose=1)
+            wav_bin = syn_func.synthesize(fs = fs, f0s = f0s, SPEC = SPEC, NM = NM)
+            outfile = os.path.join(op_path, file)
+            wavwrite("%s_bin.wav" %outfile, wav_bin, fs, norm_max_ifneeded=True, verbose=1)
+
+        elif nm_type == 'stepwise':
+            NM = syn_func.analysis_nm_steps(fs = fs, f0s = f0s, file_id = file , harm_lab = HARM_LAB, dftlen = dftlen)
+            wav_cont = syn_func.synthesize(fs = fs, f0s = f0s, SPEC = SPEC, NM = NM, nm_cont = True)
+            outfile = os.path.join(op_path, file)
+            wavwrite("%s_cont.wav" %outfile, wav_cont, fs, norm_max_ifneeded=True, verbose=1)
+        
+        elif nm_type == 'None':
+            wav_non = syn_func.synthesize(fs = fs, f0s = f0s, file_id = file, NM = None)
+            outfile = os.path.join(op_path, file)
+            wavwrite("%s_non.wav" %outfile, wav_non, fs, norm_max_ifneeded=True, verbose=1)
+
+
 def generate_wav(gen_dir, file_id_list, cfg):
 
     logger = logging.getLogger("wav_generation")
@@ -328,6 +479,10 @@ def generate_wav(gen_dir, file_id_list, cfg):
         wavgen_magphase(gen_dir, file_id_list, cfg, logger)
 
     # Add your favorite vocoder here.
+    elif cfg.vocoder_type=='pml':
+        wavgen_pulsemodel(gen_dir, file_id_list, nm_type = 'binary', fs = cfg.sr, dftlen = 1024, shift = 0.005, path_to_sptk = cfg.sptk_bindir, path_to_hed = cfg.question_file_name, path_to_lab = cfg.test_synth_dir)
+        wavgen_pulsemodel(gen_dir, file_id_list, nm_type = 'stepwise', fs = cfg.sr, dftlen = 1024, shift = 0.005, path_to_sptk = cfg.sptk_bindir, path_to_hed = cfg.question_file_name, path_to_lab = cfg.test_synth_dir)
+        #wavgen_pulsemodel(gen_dir, file_id_list, nm_type = 'None', fs = cfg.sr, dftlen = 1024, shift = 0.005)
 
     # If vocoder is not supported:
     else:
